@@ -1,91 +1,77 @@
-from util import get_redshift_connection,execute_sql, list_files_in_folder
 import pandas as pd
-import requests
-import boto3
-from datetime import datetime
-from io import StringIO
-import io
+from datetime import datetime 
+from sqlalchemy import create_engine
 import psycopg2
-import ast
-from dotenv import dotenv_values
-dotenv_values()
+import requests
+from Util import get_database_conn
 
-# Get credentials from environment variable file
-config = dotenv_values('.env')
 
-# Create a boto3 s3 client for bucket operations
-s3_client = boto3.client('s3')
-s3_resource = boto3.resource('s3')
+def extract_data():
+    urls = [
+        "https://www.football-data.co.uk/mmz4281/1920/E0.csv",
+        "https://www.football-data.co.uk/mmz4281/0203/E1.csv",
+        "https://www.football-data.co.uk/mmz4281/1920/E2.csv",
+    ]
 
-def get_data_from_api():
-    url = config.get('URL')
-    headers = ast.literal_eval(config.get('HEADERS'))
-    querystring = ast.literal_eval(config.get('QUERYSTRING'))
-    try:
-        # Send request to Rapid API and return the response as a Json object
-        response = requests.get(url, headers=headers, params=querystring).json()
-    except ConnectionError:
-        print('Unable to connect to the URL endpoint')
+    dataframes = []
 
-    coin_data = response.get('data').get('coins')
-    columns = ['symbol', 'name', 'price', 'rank', 'btcPrice', 'lowVolume']
-    crypto_price_data = pd.DataFrame(coin_data)[columns]
-    return crypto_price_data
+    for url in urls:
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  
+            if response.status_code == 200:
+                filename = url.split("/")[-1]
 
-data = get_data_from_api()
-print(data.head(20))
-    
+                with open(filename, 'wb') as file:
+                    file.write(response.content)
 
-def read_from_s3(bucket_name, path):
-    objects_list = s3_client.list_objects(Bucket = bucket_name, Prefix = path) # List the objects in the bucket
-    file = objects_list.get('Contents')[1]
-    key = file.get('Key') # Get file path or key
-    obj = s3_client.get_object(Bucket = bucket_name, Key= key)
-    data = pd.read_csv(io.BytesIO(obj['Body'].read()))
-    return data
+                print(f"Downloaded and saved {filename}")
 
-def read_multi_files_from_s3(bucket_name, prefix):
-    objects_list = s3_client.list_objects(Bucket = bucket_name, Prefix = prefix) # List the objects in the bucket
-    files = objects_list.get('Contents')
-    keys = [file.get('Key') for file in files][1:]
-    objs = [s3_client.get_object(Bucket = bucket_name, Key= key) for key in keys]
-    dfs = [pd.read_csv(io.BytesIO(obj['Body'].read())) for obj in objs]
-    data = pd.concat(dfs)
-    return data
+                try:
+                    df = pd.read_csv(filename)
+                    dataframes.append(df)
+                    print(f"Read {filename} successfully.")
+                except pd.errors.ParserError as e:
+                    print(f"Error reading {filename}: {e}")
+                except FileNotFoundError:
+                    print(f"File {filename} not found.")
+                except Exception as e:
+                    print(f"An unexpected error occurred while reading {filename}: {e}")
+            else:
+                print(f"Failed to download {url}")
+        except requests.exceptions.RequestException as e:
+            print(f"HTTP request error for {url}: {e}")
 
-# Write data to S3 Bucket
-def write_to_s3(data, bucket_name, folder):
-    file_name = f"crypto_price_data_{datetime.now().strftime('%Y%m%d')}.csv" # Create a file name
-    csv_buffer = StringIO() # Create a string buffer to collect csv string
-    data.to_csv(csv_buffer, index=False) # Convert dataframe to CSV file and add to buffer
-    csv_str = csv_buffer.getvalue() # Get the csv string
-    # using the put_object(write) operation to write the data into s3
-    s3_client.put_object(Bucket=bucket_name, Key=f'{folder}/{file_name}', Body=csv_str ) 
+    result = pd.concat(dataframes)
+    result.to_csv('combined.csv', index=False)
+    print ('Data Extraction Successful')
 
-    
-def load_to_redshift(bucket_name, folder, redshift_table_name):
-    iam_role = config.get('IAM_ROLE')
-    conn = get_redshift_connection()
-    file_paths = [f's3://{bucket_name}/{file_name}' for file_name in list_files_in_folder(bucket_name, folder)]
-    for file_path in file_paths:
-        copy_query = f"""
-        copy {redshift_table_name}
-        from '{file_path}'
-        IAM_ROLE '{iam_role}'
-        csv
-        IGNOREHEADER 1;
-        """
-        execute_sql(copy_query, conn)
-    print('Data successfully loaded to Redshift')
+extract_data()
 
-def move_files_to_processed_folder(bucket_name, raw_data_folder, processed_data_folder):
-    file_paths = list_files_in_folder(bucket_name, raw_data_folder)
-    for file_path in file_paths:
-        file_name = file_path.split('/')[-1]
-        copy_source = {'Bucket': bucket_name, 'Key': file_path}
-        # Copy files to processed folder
-        s3_resource.meta.client.copy(copy_source, bucket_name, processed_data_folder + '/' + file_name)
-        s3_resource.Object(bucket_name, file_path).delete()
-    print("Files successfully moved to 'processed_data' folder in S3")
+
+def transform_data():
+    data = pd.read_csv('combined.csv')
+    date_format = "%d/%m/%Y"  
+    time_format = "%H:%M" 
+    data['Datetime'] = pd.to_datetime(data['Date'] + ' ' + data['Time'], format=f"{date_format} {time_format}")
+    data = data.drop(['Date', 'Time'], axis=1)
+    column_to_move = data.pop('Datetime')
+    position = 1
+    data.insert(position, 'Datetime', column_to_move)
+    data = data.rename(columns={'HomeTeam':'Home', 'AwayTeam':'Away'})
+    data = data.drop(['MaxC<2.5','AvgC>2.5','AvgC<2.5','AHCh','B365CAHH','B365CAHA','PCAHH','PCAHA','MaxCAHH','MaxCAHA','AvgCAHH','AvgCAHA'], axis=1 )
+    data.fillna(value=0, inplace=True)
+    data.to_csv ('tt/transformed_data.csv', index=False)
+    print ('Tranformation Successful')
+
+transform_data()
+
+def load_data():
+    data = pd.read_csv('tt/transformed_data.csv')
+    engine = get_database_conn()
+    data.to_sql('betting_data', con=engine, if_exists = 'append', index = False)
+    print ('Data Successfully Written To PostgresSQL Database')
+
+load_data()
 
 
